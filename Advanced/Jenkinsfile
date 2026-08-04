@@ -1,0 +1,559 @@
+pipeline {
+
+    agent none
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+
+        JAVA17_HOME = "/usr/lib/jvm/java-17-openjdk-amd64"
+
+        GIT_REPO = "https://github.com/Shyamsandeep28/enterprise-devops-project.git"
+        GIT_BRANCH = "main"
+
+        LOGIN_IMAGE = "sandeep289/loginservice"
+        CATALOG_IMAGE = "sandeep289/catalogservice"
+
+    }
+
+    stages {
+
+        /*************************************************************
+        CHECKOUT SOURCE CODE
+        **************************************************************/
+
+        stage('Checkout Code') {
+
+            agent {
+                label 'maven'
+            }
+
+            steps {
+
+                cleanWs()
+
+                git branch: "${GIT_BRANCH}",
+                    url: "${GIT_REPO}"
+
+                sh "ls -lrt"
+
+                stash name: 'source-code',
+                      includes: '**/*'
+            }
+        }
+
+        /*************************************************************
+        BUILD LOGIN SERVICE
+        **************************************************************/
+
+        stage('Build Login Service') {
+
+            agent {
+                label 'maven'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'source-code'
+
+                dir('loginservice') {
+
+                    sh '''
+
+                    export JAVA_HOME=$JAVA17_HOME
+                    export PATH=$JAVA_HOME/bin:$PATH
+
+                    echo "Java Version"
+
+                    java -version
+
+                    echo "Compiler Version"
+
+                    javac -version
+
+                    mvn clean package
+
+                    ls -lrt target
+
+                    '''
+
+                }
+
+                stash name: 'login-build',
+                      includes: '**/*'
+
+            }
+
+        }
+
+        /*************************************************************
+        BUILD CATALOG SERVICE
+        **************************************************************/
+
+        stage('Build Catalog Service') {
+
+            agent {
+                label 'maven'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'login-build'
+
+                dir('catalogservice') {
+
+                    sh '''
+
+                    export JAVA_HOME=$JAVA17_HOME
+                    export PATH=$JAVA_HOME/bin:$PATH
+
+                    java -version
+
+                    javac -version
+
+                    mvn clean package
+
+                    ls -lrt target
+
+                    '''
+
+                }
+
+                stash name: 'maven-build',
+                      includes: '**/*'
+
+            }
+
+        }
+
+        /*************************************************************
+        TRIVY FILE SYSTEM SCAN
+        **************************************************************/
+
+        stage('Trivy File System Scan') {
+
+            agent {
+
+                label 'docker'
+
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'maven-build'
+
+                sh '''
+
+                trivy fs .
+
+                '''
+
+                stash name: 'workspace-after-trivy',
+                      includes: '**/*'
+
+            }
+
+       
+                /*************************************************************
+        SONARQUBE SCAN - LOGIN SERVICE
+        **************************************************************/
+
+        stage('SonarQube Scan Login Service') {
+
+            agent {
+                label 'sonar'
+            }
+
+            environment {
+                SCANNER_HOME = "/opt/sonar-scanner"
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'workspace-after-trivy'
+
+                withCredentials([
+                    string(credentialsId: 'sonar-token',
+                           variable: 'SONAR_TOKEN')
+                ]) {
+
+                    dir('loginservice') {
+
+                        sh '''
+
+                        export JAVA_HOME=$JAVA17_HOME
+                        export PATH=$JAVA_HOME/bin:$PATH
+
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectName=loginservice \
+                        -Dsonar.projectKey=loginservice \
+                        -Dsonar.sources=src \
+                        -Dsonar.java.binaries=target/classes \
+                        -Dsonar.host.url=http://13.206.83.5:9000 \
+                        -Dsonar.login=$SONAR_TOKEN
+
+                        '''
+
+                    }
+
+                }
+
+                stash name: 'login-sonar',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        SONARQUBE SCAN - CATALOG SERVICE
+        **************************************************************/
+
+        stage('SonarQube Scan Catalog Service') {
+
+            agent {
+                label 'sonar'
+            }
+
+            environment {
+                SCANNER_HOME = "/opt/sonar-scanner"
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'login-sonar'
+
+                withCredentials([
+                    string(credentialsId: 'sonar-token',
+                           variable: 'SONAR_TOKEN')
+                ]) {
+
+                    dir('catalogservice') {
+
+                        sh '''
+
+                        export JAVA_HOME=$JAVA17_HOME
+                        export PATH=$JAVA_HOME/bin:$PATH
+
+                        ${SCANNER_HOME}/bin/sonar-scanner \
+                        -Dsonar.projectName=catelogservice \
+                        -Dsonar.projectKey=catelogservice \
+                        -Dsonar.sources=src \
+                        -Dsonar.java.binaries=target/classes \
+                        -Dsonar.host.url=http://13.206.83.5:9000 \
+                        -Dsonar.login=$SONAR_TOKEN
+
+                        '''
+
+                    }
+
+                }
+
+                stash name: 'workspace-after-sonar',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        WAIT FOR QUALITY GATE
+        **************************************************************/
+
+        stage('Quality Gate') {
+
+            agent {
+                label 'sonar'
+            }
+
+            steps {
+
+                timeout(time: 10, unit: 'MINUTES') {
+
+                    waitForQualityGate abortPipeline: true
+
+                }
+
+                stash name: 'workspace-after-qualitygate',
+                      includes: '**/*'
+
+            }
+
+        }
+                  /*************************************************************
+        BUILD DOCKER IMAGE - LOGIN SERVICE
+        **************************************************************/
+
+        stage('Build Docker Image Login') {
+
+            agent {
+                label 'docker'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'workspace-after-qualitygate'
+
+                dir('loginservice') {
+
+                    sh '''
+
+                    docker build \
+                    -t ${LOGIN_IMAGE}:${BUILD_NUMBER} .
+
+                    '''
+
+                }
+
+                stash name: 'login-docker-build',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        BUILD DOCKER IMAGE - CATALOG SERVICE
+        **************************************************************/
+
+        stage('Build Docker Image Catalog') {
+
+            agent {
+                label 'docker'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'login-docker-build'
+
+                dir('catalogservice') {
+
+                    sh '''
+
+                    docker build \
+                    -t ${CATALOG_IMAGE}:${BUILD_NUMBER} .
+
+                    '''
+
+                }
+
+                stash name: 'docker-images-ready',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        TRIVY IMAGE SCAN
+        **************************************************************/
+
+        stage('Trivy Image Scan') {
+
+            agent {
+                label 'docker'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'docker-images-ready'
+
+                sh '''
+
+                trivy image ${LOGIN_IMAGE}:${BUILD_NUMBER}
+
+                trivy image ${CATALOG_IMAGE}:${BUILD_NUMBER}
+
+                '''
+
+                stash name: 'images-scanned',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        PUSH LOGIN IMAGE
+        **************************************************************/
+
+        stage('Push Login Image') {
+
+            agent {
+                label 'docker'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'images-scanned'
+
+                script {
+
+                    withDockerRegistry(
+                        credentialsId: 'dockerhub-creds',
+                        url: ''
+                    ) {
+
+                        sh '''
+
+                        docker push ${LOGIN_IMAGE}:${BUILD_NUMBER}
+
+                        '''
+
+                    }
+
+                }
+
+                stash name: 'login-image-pushed',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        PUSH CATALOG IMAGE
+        **************************************************************/
+
+        stage('Push Catalog Image') {
+
+            agent {
+                label 'docker'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'login-image-pushed'
+
+                script {
+
+                    withDockerRegistry(
+                        credentialsId: 'dockerhub-creds',
+                        url: ''
+                    ) {
+
+                        sh '''
+
+                        docker push ${CATALOG_IMAGE}:${BUILD_NUMBER}
+
+                        '''
+
+                    }
+
+                }
+
+                stash name: 'deployment-ready',
+                      includes: '**/*'
+
+            }
+
+        }
+
+
+        /*************************************************************
+        DEPLOY TO KUBERNETES
+        **************************************************************/
+
+        stage('Deploy To Kubernetes') {
+
+            agent {
+                label 'k8s'
+            }
+
+            steps {
+
+                cleanWs()
+
+                unstash 'deployment-ready'
+
+                sh '''
+
+                kubectl apply -f kubernetes/
+
+                '''
+
+                sh '''
+
+                kubectl set image deployment/login-deployment \
+                login-container=${LOGIN_IMAGE}:${BUILD_NUMBER}
+
+                '''
+
+                sh '''
+
+                kubectl set image deployment/catalog-deployment \
+                catalog-container=${CATALOG_IMAGE}:${BUILD_NUMBER}
+
+                '''
+
+            }
+
+        }
+
+    }
+
+
+    /*************************************************************
+    POST BUILD ACTIONS
+    **************************************************************/
+
+    post {
+
+        always {
+
+            cleanWs()
+
+        }
+
+        success {
+
+            echo "========================================="
+            echo "Pipeline Executed Successfully"
+            echo "Build Number : ${BUILD_NUMBER}"
+            echo "========================================="
+
+        }
+
+        failure {
+
+            echo "========================================="
+            echo "Pipeline Failed"
+            echo "Build Number : ${BUILD_NUMBER}"
+            echo "========================================="
+
+        }
+
+    }
+
+}
+        }
